@@ -1,42 +1,102 @@
-#root {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  text-align: center;
+.invoice-preview {
+  overscroll-behavior: contain;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: filter 300ms;
-}
-.logo:hover {
-  filter: drop-shadow(0 0 2em #646cffaa);
-}
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafbaa);
-}
-
-@keyframes logo-spin {
-  from {
-    transform: rotate(0deg);
+@media screen and (max-width: 860px) {
+  .invoice-preview {
+    align-items: flex-start;
+    padding: 4.5rem 0.75rem 1rem;
   }
-  to {
-    transform: rotate(360deg);
+
+  .invoice-page {
+    flex-shrink: 0;
   }
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  a:nth-of-type(2) .logo {
-    animation: logo-spin infinite 20s linear;
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }
 
-.card {
-  padding: 2em;
+@page {
+  size: A4;
+  margin: 0;
 }
 
-.read-the-docs {
-  color: #888;
+@media print {
+  html,
+  body,
+  #root {
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    background: white;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* Keep only the invoice and its ancestors in the printed document. */
+  body:has(.invoice-preview)
+    #root
+    :not(:has(.invoice-preview)):not(.invoice-preview, .invoice-preview *) {
+    display: none !important;
+  }
+
+  body:has(.invoice-preview) #root :has(.invoice-preview) {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    background: white !important;
+  }
+
+  .invoice-preview {
+    display: block !important;
+    position: static !important;
+    inset: auto !important;
+    width: 210mm !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    background: white !important;
+  }
+
+  .invoice-preview > :not(.invoice-page) {
+    display: none !important;
+  }
+
+  .invoice-page {
+    width: 210mm !important;
+    min-height: 297mm !important;
+    margin: 0 !important;
+    padding: 10mm !important;
+    box-shadow: none !important;
+    break-inside: avoid;
+    break-after: page;
+  }
+
+  .invoice-page:last-child {
+    break-after: auto;
+  }
+
+  .invoice-page tr {
+    break-inside: avoid;
+  }
+
+  .invoice-page thead {
+    display: table-header-group;
+  }
 }

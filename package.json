@@ -5,21 +5,28 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:demo": "VITE_USE_EMULATORS=true vite --host 127.0.0.1",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "firebase:login": "firebase login",
+    "emulators": "firebase emulators:start --only auth,firestore --project demo-ming-jii-cloud",
+    "deploy:free": "node scripts/deploy-free.mjs",
+    "test:deploy": "node --test scripts/deploy-free.test.mjs"
   },
   "dependencies": {
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "firebase": "^10.0.0",
-   "lucide-react": "^0.200.0"
+    "lucide-react": "^1.50.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "firebase-tools": "15.32.1",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",

@@ -1,24 +1,12 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { initializeApp } from 'firebase/app';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
+import Login from './Login';
+import { auth, db, appId, configurationError, describeServiceError, emulatorMode, initializeSession } from './firebase';
 import { 
-  getAuth, 
-  signInAnonymously, 
-  signInWithCustomToken,
-  onAuthStateChanged 
-} from 'firebase/auth';
-import { 
-  getFirestore, 
   collection, 
   doc, 
   setDoc, 
-  addDoc,
-  getDocs, 
-  query, 
-  where, 
-  orderBy, 
-  onSnapshot,
-  Timestamp,
-  updateDoc
+  onSnapshot
 } from 'firebase/firestore';
 import { 
   LayoutDashboard, 
@@ -53,33 +41,6 @@ import {
   AlertCircle,
   MapPin
 } from 'lucide-react';
-
-// --- Firebase Configuration & Initialization ---
-// ⚠️ 注意：这就是教程里提到的部分 (Line 46 - 68)
-let firebaseConfig;
-let appId = 'ming-jii-default';
-
-try {
-  // 1. 尝试读取预览环境的配置 (Preview Mode)
-  // 如果你在 Vercel/StackBlitz，这步会报错，然后跳到 catch 块
-  firebaseConfig = JSON.parse(__firebase_config);
-  if(typeof __app_id !== 'undefined') appId = __app_id;
-} catch (e) {
-  // 2. --- ⚠️ 这里填入你自己的 FIREBASE 配置 (部署模式) ---
-  // 请将下面的 YOUR_API_KEY 等替换成你在 Firebase 控制台复制的内容
-  firebaseConfig = {
-    apiKey: "YOUR_API_KEY_HERE",
-    authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-    projectId: "YOUR_PROJECT_ID",
-    storageBucket: "YOUR_PROJECT_ID.appspot.com",
-    messagingSenderId: "YOUR_SENDER_ID",
-    appId: "YOUR_APP_ID"
-  };
-}
-
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
 
 // --- Helper Functions ---
 const formatCurrency = (amount) => {
@@ -179,7 +140,7 @@ const InvoicePreviewModal = ({ items, total, date, invNo, branchName, branchAddr
     }, []);
 
     return (
-      <div className="fixed inset-0 bg-slate-900/90 z-[90] overflow-auto py-10 flex flex-col items-center">
+      <div className="invoice-preview fixed inset-0 bg-slate-900/90 z-[90] overflow-auto py-10 flex flex-col items-center">
         <div className="fixed top-4 right-4 flex gap-2 print:hidden z-[100]">
           <button onClick={() => window.print()} className="bg-blue-600 text-white px-6 py-2 rounded flex items-center gap-2 hover:bg-blue-700 shadow-lg font-bold"><Printer size={18}/> Print Again</button>
           <button onClick={onClose} className="bg-gray-200 text-gray-800 px-6 py-2 rounded hover:bg-gray-300 font-bold">Close</button>
@@ -192,7 +153,7 @@ const InvoicePreviewModal = ({ items, total, date, invNo, branchName, branchAddr
             const col2 = pageItems.slice(mid);
 
             return (
-                <div key={pageIndex} className="bg-white w-[210mm] min-h-[297mm] p-8 shadow-2xl mb-8 relative print:mb-0 print:shadow-none print:break-after-page flex flex-col">
+                <div key={pageIndex} className="invoice-page bg-white w-[210mm] min-h-[297mm] p-8 shadow-2xl mb-8 relative print:mb-0 print:shadow-none print:break-after-page flex flex-col">
                     <div className="text-center mb-4">
                         <h1 className="text-2xl font-bold tracking-wide">MING JII RESTAURANT SDN BHD</h1>
                         <p className="text-xs">(Company No. 1323914-H)</p>
@@ -551,11 +512,10 @@ const ProductManager = ({ products, onUpdateProduct, onInitData }) => {
 };
 
 // 3. New Invoice / Order Form
-const OrderForm = ({ products, branches, onSaveOrder, orders }) => {
+const OrderForm = ({ products, branches, onSaveOrder, orders, onPendingChange }) => {
   const [selectedBranch, setSelectedBranch] = useState(branches[0]?.id || '');
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
-  const [quantities, setQuantities] = useState({});
-  const [saveStatus, setSaveStatus] = useState('saved');
+  const [drafts, setDrafts] = useState({});
   const [isSaving, setIsSaving] = useState(false); 
   const [searchTerm, setSearchTerm] = useState('');
   const [alertMsg, setAlertMsg] = useState(null); 
@@ -564,79 +524,141 @@ const OrderForm = ({ products, branches, onSaveOrder, orders }) => {
   const [showPreview, setShowPreview] = useState(false);
   const [previewData, setPreviewData] = useState(null);
   
-  const lastLoadedContext = useRef({ date: null, branchId: null });
-  const currentBranch = branches.find(b => b.id === selectedBranch);
-  
-  const [existingOrderData, setExistingOrderData] = useState(null);
+  const saveJobs = useRef(new Map());
+  const branchId = selectedBranch || branches[0]?.id || '';
+  const currentBranch = branches.find(b => b.id === branchId);
+  const contextKey = `${date}:${branchId}`;
+  const existingOrderData = orders.find(o => o.date === date && o.branchId === branchId);
+  const currentDraft = drafts[contextKey];
+  const quantities = currentDraft?.quantities || Object.fromEntries(
+    (existingOrderData?.items || []).map(item => [item.id, item.qty])
+  );
+  const saveStatus = currentDraft?.status || 'saved';
+
+  const persistDraft = React.useCallback((key, draft) => {
+    const pending = saveJobs.current.get(key);
+    if (pending?.revision === draft.revision) return pending.promise;
+
+    // Queue writes to the same invoice so a slower older save cannot win.
+    const promise = (pending?.promise || Promise.resolve()).catch(() => {}).then(async () => {
+      const branch = branches.find(b => b.id === draft.branchId);
+      if (!branch) throw new Error('Please choose a branch before saving.');
+      const items = Object.entries(draft.quantities).flatMap(([pid, qty]) => {
+        const product = products.find(p => p.id === pid);
+        const q = parseFloat(qty);
+        return product && Number.isFinite(q) && q > 0
+          ? [{ ...product, qty: q, amount: product.price * q }]
+          : [];
+      });
+      const orderData = {
+        date: draft.date,
+        branchId: draft.branchId,
+        branchName: branch.name,
+        items,
+        totalAmount: items.reduce((total, item) => total + item.amount, 0),
+        createdAt: draft.createdAt,
+        status: 'completed',
+        year: parseInt(draft.date.split('-')[0]),
+        month: parseInt(draft.date.split('-')[1])
+      };
+      const updateStatus = (status) => setDrafts(previous => {
+        if (previous[key]?.revision !== draft.revision) return previous;
+        return { ...previous, [key]: { ...previous[key], status } };
+      });
+      updateStatus('saving');
+      try {
+        await onSaveOrder(orderData);
+        updateStatus('saved');
+        return orderData;
+      } catch (error) {
+        updateStatus('error');
+        throw error;
+      }
+    });
+    const job = { revision: draft.revision, promise };
+    saveJobs.current.set(key, job);
+    const cleanUp = () => {
+      if (saveJobs.current.get(key) === job) saveJobs.current.delete(key);
+    };
+    promise.then(cleanUp, cleanUp);
+    return promise;
+  }, [branches, products, onSaveOrder]);
 
   useEffect(() => {
-    if (lastLoadedContext.current.date !== date || lastLoadedContext.current.branchId !== selectedBranch) {
-        const existingOrder = orders.find(o => o.date === date && o.branchId === selectedBranch);
-        if (existingOrder) {
-            const qtyMap = {};
-            existingOrder.items.forEach(item => {
-                qtyMap[item.id] = item.qty;
-            });
-            setQuantities(qtyMap);
-            setExistingOrderData(existingOrder);
-        } else {
-            setQuantities({});
-            setExistingOrderData(null);
-        }
-        lastLoadedContext.current = { date, branchId: selectedBranch };
-    }
-  }, [date, selectedBranch, orders]);
-
-  useEffect(() => {
+    const pendingDrafts = Object.entries(drafts).filter(([, draft]) => draft.status === 'unsaved');
+    if (!pendingDrafts.length) return;
     const timer = setTimeout(() => {
-        if (Object.keys(quantities).length === 0 && saveStatus === 'saved') return; 
-
-        setSaveStatus('saving...');
-        
-        let total = 0;
-        const items = [];
-        Object.entries(quantities).forEach(([pid, qty]) => {
-            const product = products.find(p => p.id === pid);
-            const q = parseFloat(qty);
-            if (product && !isNaN(q) && q > 0) {
-                total += product.price * q;
-                items.push({ ...product, qty: q, amount: product.price * q });
-            }
-        });
-
-        const creationTime = existingOrderData ? existingOrderData.createdAt : new Date().toISOString();
-
-        const orderData = {
-            date,
-            branchId: selectedBranch,
-            branchName: currentBranch.name,
-            items,
-            totalAmount: total,
-            createdAt: creationTime,
-            status: 'completed',
-            year: parseInt(date.split('-')[0]),
-            month: parseInt(date.split('-')[1])
-        };
-
-        onSaveOrder(orderData);
-        setTimeout(() => setSaveStatus('saved'), 500);
-
-    }, 1000); 
-
+      pendingDrafts.forEach(([key, draft]) => {
+        persistDraft(key, draft).catch(() => {});
+      });
+    }, 1000);
     return () => clearTimeout(timer);
-  }, [quantities, date, selectedBranch, existingOrderData]);
+  }, [drafts, persistDraft]);
+
+  useEffect(() => {
+    if (!Object.values(drafts).some(draft => draft.status !== 'saved')) return;
+    const warnBeforeLeaving = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', warnBeforeLeaving);
+    return () => window.removeEventListener('beforeunload', warnBeforeLeaving);
+  }, [drafts]);
+
+  useEffect(() => {
+    onPendingChange?.(Object.values(drafts).some(draft => draft.status !== 'saved'));
+  }, [drafts, onPendingChange]);
+
+  useEffect(() => {
+    // Keep a saved draft until its snapshot arrives, then show shared updates again.
+    const acknowledged = Object.entries(drafts).filter(([, draft]) => {
+      if (draft.status !== 'saved') return false;
+      const order = orders.find(o => o.date === draft.date && o.branchId === draft.branchId);
+      if (!order) return false;
+      const entered = Object.entries(draft.quantities)
+        .filter(([, qty]) => Number.isFinite(parseFloat(qty)) && parseFloat(qty) > 0);
+      return entered.length === order.items.length && entered.every(([id, qty]) =>
+        order.items.some(item => item.id === id && item.qty === parseFloat(qty))
+      );
+    });
+    if (!acknowledged.length) return;
+    const timer = setTimeout(() => setDrafts(previous => {
+      const next = { ...previous };
+      acknowledged.forEach(([key, draft]) => {
+        if (next[key]?.revision === draft.revision && next[key].status === 'saved') delete next[key];
+      });
+      return next;
+    }), 0);
+    return () => clearTimeout(timer);
+  }, [drafts, orders]);
+
+  const updateQuantities = (getQuantities) => {
+    if (!currentBranch || !date) return;
+    setDrafts(previous => {
+      const previousDraft = previous[contextKey];
+      return {
+        ...previous,
+        [contextKey]: {
+          date,
+          branchId,
+          createdAt: previousDraft?.createdAt || existingOrderData?.createdAt || new Date().toISOString(),
+          quantities: getQuantities(previousDraft?.quantities || quantities),
+          revision: (previousDraft?.revision || 0) + 1,
+          status: 'unsaved'
+        }
+      };
+    });
+  };
 
   const handleQtyChange = (productId, qty) => {
     const val = parseFloat(qty);
     const product = products.find(p => p.id === productId);
-    
+
     if (val > 100) {
         setAlertMsg(`⚠️ 注意：${product?.name} 数量超过 100 (Qty: ${val})！`);
         setTimeout(() => setAlertMsg(null), 4000);
     }
-
-    setQuantities(prev => ({ ...prev, [productId]: qty }));
-    setSaveStatus('unsaved');
+    updateQuantities(previous => ({ ...previous, [productId]: qty }));
   };
 
   const handleKeyDown = (e, index) => {
@@ -698,36 +720,33 @@ const OrderForm = ({ products, branches, onSaveOrder, orders }) => {
       return;
     }
 
-    setIsSaving(true);
-    let total = 0;
-    items.forEach(item => total += item.amount);
-    const creationTime = existingOrderData ? existingOrderData.createdAt : new Date().toISOString();
-
-    const orderData = {
+    if (!currentBranch || !date) return;
+    const draft = currentDraft || {
       date,
-      branchId: selectedBranch,
-      branchName: currentBranch.name,
-      items,
-      totalAmount: total,
-      createdAt: creationTime,
-      status: 'completed',
-      year: parseInt(date.split('-')[0]),
-      month: parseInt(date.split('-')[1])
+      branchId,
+      quantities,
+      createdAt: existingOrderData?.createdAt || new Date().toISOString(),
+      revision: 1,
+      status: 'unsaved'
     };
-
-    await onSaveOrder(orderData);
-    setIsSaving(false);
-    
-    // Set data for preview and open modal
-    setPreviewData({
-        items,
-        total,
-        date,
-        invNo: new Date(creationTime).getTime().toString().slice(-6),
-        branchName: currentBranch.name,
+    setDrafts(previous => ({ ...previous, [contextKey]: draft }));
+    setIsSaving(true);
+    try {
+      const savedOrder = await persistDraft(contextKey, draft);
+      setPreviewData({
+        items: savedOrder.items.map((item, index) => ({ ...item, originalIndex: index })),
+        total: savedOrder.totalAmount,
+        date: savedOrder.date,
+        invNo: new Date(savedOrder.createdAt).getTime().toString().slice(-6),
+        branchName: savedOrder.branchName,
         branchAddress: currentBranch.address
-    });
-    setShowPreview(true);
+      });
+      setShowPreview(true);
+    } catch {
+      setAlertMsg('保存失败，数量仍保留。请检查连接后重试。');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
@@ -758,7 +777,7 @@ const OrderForm = ({ products, branches, onSaveOrder, orders }) => {
             </div>
             <div className="flex items-center gap-2 bg-slate-100 px-3 py-2 rounded-lg flex-1 border border-slate-200">
               <Store className="text-slate-500" size={18} />
-              <select className="bg-transparent outline-none font-medium w-full text-slate-700" value={selectedBranch} onChange={(e) => setSelectedBranch(e.target.value)}>
+              <select className="bg-transparent outline-none font-medium w-full text-slate-700" value={branchId} onChange={(e) => setSelectedBranch(e.target.value)}>
                 {branches.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
               </select>
             </div>
@@ -767,7 +786,9 @@ const OrderForm = ({ products, branches, onSaveOrder, orders }) => {
              <div className="text-right">
                 <span className="text-xs text-slate-400 block uppercase font-bold tracking-wider">Status</span>
                 <span className={`text-sm font-bold flex items-center gap-1 ${saveStatus === 'saved' ? 'text-green-600' : 'text-orange-500'}`}>
-                    {saveStatus === 'saved' ? <><CheckCircle size={14}/> Saved</> : <><Loader size={14} className="animate-spin"/> Saving...</>}
+                    {saveStatus === 'saved' ? <><CheckCircle size={14}/> Saved</> : saveStatus === 'error'
+                      ? <button onClick={() => persistDraft(contextKey, currentDraft).catch(() => {})}><AlertCircle size={14}/> 保存失败，点击重试</button>
+                      : <><Loader size={14} className="animate-spin"/> Saving...</>}
                 </span>
              </div>
              <div className="text-xl font-bold text-slate-800 whitespace-nowrap">
@@ -823,7 +844,7 @@ const OrderForm = ({ products, branches, onSaveOrder, orders }) => {
       </div>
 
       <div className="fixed bottom-6 right-6 md:right-10 flex gap-4">
-        <button onClick={() => { if(confirm("Clear all?")) setQuantities({}); }} className="bg-white text-slate-600 shadow-lg px-6 py-4 rounded-full font-bold hover:bg-slate-50 border hidden md:block">Reset 清空</button>
+        <button onClick={() => { if(confirm("Clear all?")) updateQuantities(() => ({})); }} className="bg-white text-slate-600 shadow-lg px-6 py-4 rounded-full font-bold hover:bg-slate-50 border hidden md:block">Reset 清空</button>
         <button 
           onClick={handleSaveAndPrint}
           disabled={isSaving}
@@ -841,7 +862,6 @@ const Reports = ({ orders, branches }) => {
   const [year, setYear] = useState(new Date().getFullYear());
   const [month, setMonth] = useState(new Date().getMonth() + 1); 
   const [filterBranch, setFilterBranch] = useState('all');
-  const [reportType, setReportType] = useState('monthly'); 
   const [viewMode, setViewMode] = useState('stats');
   
   // State for Reprint Modal
@@ -852,10 +872,10 @@ const Reports = ({ orders, branches }) => {
     return orders.filter(order => {
       const date = new Date(order.date);
       return date.getFullYear() === year && 
-             (reportType === 'monthly' ? date.getMonth() + 1 === month : true) &&
+             date.getMonth() + 1 === month &&
              (filterBranch === 'all' ? true : order.branchId === filterBranch);
     });
-  }, [orders, year, month, filterBranch, reportType]);
+  }, [orders, year, month, filterBranch]);
 
   const stats = useMemo(() => {
     let totalSales = 0;
@@ -885,7 +905,7 @@ const Reports = ({ orders, branches }) => {
 
   const handleReprint = (order) => {
       setReprintOrder({
-          items: order.items,
+          items: order.items.map((item, index) => ({ ...item, originalIndex: index })),
           total: order.totalAmount,
           date: order.date,
           invNo: new Date(order.createdAt).getTime().toString().slice(-6),
@@ -960,21 +980,19 @@ const Reports = ({ orders, branches }) => {
 // 5. Settings (Add Branch + Storage Status)
 const SettingsPage = ({ branches, onAddBranch, products, orders }) => {
    const [newBranch, setNewBranch] = useState({ name: '', address: '' });
-   const calculateStorage = () => {
-       const productsSize = new Blob([JSON.stringify(products)]).size;
-       const ordersSize = new Blob([JSON.stringify(orders)]).size;
-       const totalBytes = productsSize + ordersSize;
-       const totalKB = (totalBytes / 1024).toFixed(2);
-       const totalMB = (totalBytes / (1024 * 1024)).toFixed(4);
-       const limitBytes = 1024 * 1024 * 1024; 
-       const percentage = Math.min((totalBytes / limitBytes) * 100, 100).toFixed(6);
-       return { totalKB, totalMB, percentage };
-   };
-   const usage = calculateStorage();
-   const handleAdd = () => {
+   const [adding, setAdding] = useState(false);
+   const sizeKB = (new Blob([JSON.stringify({ products, orders, branches })]).size / 1024).toFixed(2);
+   const handleAdd = async () => {
      if(newBranch.name && newBranch.address) {
-       onAddBranch({ ...newBranch, id: `b${Date.now()}` });
-       setNewBranch({ name: '', address: '' });
+       setAdding(true);
+       try {
+         await onAddBranch({ ...newBranch, id: `b${Date.now()}` });
+         setNewBranch({ name: '', address: '' });
+       } catch (error) {
+         alert(describeServiceError(error));
+       } finally {
+         setAdding(false);
+       }
      }
    }
 
@@ -982,11 +1000,11 @@ const SettingsPage = ({ branches, onAddBranch, products, orders }) => {
      <div className="p-6 max-w-4xl mx-auto">
        <h2 className="text-2xl font-bold mb-6 flex items-center gap-2"><Settings /> 系统设定</h2>
        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 mb-6">
-            <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-slate-800"><Cloud className="text-blue-500"/> 云端存储空间 (Cloud Storage)</h3>
+            <h3 className="font-bold text-lg mb-4 flex items-center gap-2 text-slate-800"><Cloud className="text-blue-500"/> 当前账号资料</h3>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                <div className="bg-slate-50 p-4 rounded-lg border border-slate-100"><p className="text-xs text-slate-400 uppercase tracking-wider font-bold">已用空间 Used</p><p className="text-2xl font-bold text-slate-700">{usage.totalKB} <span className="text-sm text-slate-500">KB</span></p></div>
-                <div className="bg-blue-50 p-4 rounded-lg border border-blue-100"><p className="text-xs text-blue-400 uppercase tracking-wider font-bold">剩余空间 Remaining</p><p className="text-2xl font-bold text-blue-700">~1024 <span className="text-sm text-blue-500">MB</span></p></div>
-                <div className="flex flex-col justify-center"><div className="flex justify-between text-xs mb-1 font-bold text-slate-600"><span>Usage</span><span>{usage.percentage}%</span></div><div className="w-full bg-slate-200 rounded-full h-3 overflow-hidden"><div className="bg-blue-500 h-3 rounded-full transition-all duration-500" style={{ width: `${Math.max(parseFloat(usage.percentage), 1)}%` }}></div></div></div>
+                <div className="bg-slate-50 p-4 rounded-lg border border-slate-100"><p className="text-xs text-slate-400 font-bold">资料大小估算</p><p className="text-2xl font-bold text-slate-700">{sizeKB} <span className="text-sm text-slate-500">KB</span></p><p className="text-xs text-slate-500 mt-2">按当前载入资料估算</p></div>
+                <div className="bg-blue-50 p-4 rounded-lg border border-blue-100"><p className="text-xs text-blue-400 font-bold">已保存订单</p><p className="text-2xl font-bold text-blue-700">{orders.length}</p></div>
+                <div className="bg-slate-50 p-4 rounded-lg border border-slate-100"><p className="text-xs text-slate-400 font-bold">货物 / 分店</p><p className="text-2xl font-bold text-slate-700">{products.length} / {branches.length}</p></div>
             </div>
        </div>
        <div className="bg-white p-6 rounded-lg shadow-sm border mb-6">
@@ -1001,7 +1019,7 @@ const SettingsPage = ({ branches, onAddBranch, products, orders }) => {
             <div className="grid gap-4">
               <input type="text" placeholder="Branch Name (e.g. Mount Austin)" className="p-2 border rounded" value={newBranch.name} onChange={e => setNewBranch({...newBranch, name: e.target.value})}/>
               <textarea placeholder="Address" className="p-2 border rounded" value={newBranch.address} onChange={e => setNewBranch({...newBranch, address: e.target.value})}/>
-              <button onClick={handleAdd} className="bg-slate-800 text-white py-2 rounded hover:bg-slate-900">Add Branch</button>
+              <button onClick={handleAdd} disabled={adding} className="bg-slate-800 text-white py-2 rounded hover:bg-slate-900">{adding ? '正在保存…' : 'Add Branch'}</button>
             </div>
          </div>
        </div>
@@ -1010,66 +1028,103 @@ const SettingsPage = ({ branches, onAddBranch, products, orders }) => {
 }
 
 // --- Main App Container ---
+const emptyCloudData = (owner = null) => ({
+  owner,
+  products: [],
+  orders: [],
+  branches: [],
+  ready: { products: false, orders: false, branches: false },
+  error: '',
+});
+
 const App = () => {
-  const [user, setUser] = useState(null);
+  const [session, setSession] = useState({ user: null, ready: false, error: '' });
   const [currentView, setView] = useState('newOrder');
-  const [products, setProducts] = useState([]);
-  const [orders, setOrders] = useState([]);
-  const [branches, setBranches] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [cloudData, setCloudData] = useState(emptyCloudData);
+  const [pendingChanges, setPendingChanges] = useState(false);
+  const user = session.user;
+  const { products, orders, branches } = cloudData;
 
   useEffect(() => {
-    const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else {
-        await signInAnonymously(auth);
-      }
-    };
-    initAuth();
-    return onAuthStateChanged(auth, setUser);
+    if (!auth) return;
+    let active = true;
+    const unsubscribe = onAuthStateChanged(auth, currentUser => {
+      if (active) setSession({ user: currentUser, ready: true, error: '' });
+    }, error => {
+      if (active) setSession({ user: null, ready: true, error: describeServiceError(error) });
+    });
+    initializeSession().catch(error => {
+      if (active) setSession(previous => ({ ...previous, ready: true, error: describeServiceError(error) }));
+    });
+    return () => { active = false; unsubscribe(); };
   }, []);
 
   useEffect(() => {
-    if (!user) return;
-    const prodUnsub = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'products'), async (snap) => {
-      let list = snap.docs.map(d => d.data());
-      if (list.length === 0) {
-         try {
-            await Promise.all(DEFAULT_PRODUCTS.map(p => setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'products', p.id), p)));
-         } catch(e) {}
-      } else {
-         setProducts(list.sort((a,b) => parseInt(a.code) - parseInt(b.code)));
+    if (!user || !db) return;
+    let active = true;
+    let productSeed;
+    let branchSeed;
+    const applyRows = (name, rows) => {
+      if (!active) return;
+      setCloudData(previous => {
+        const current = previous.owner === user.uid ? previous : emptyCloudData(user.uid);
+        return { ...current, [name]: rows, ready: { ...current.ready, [name]: true } };
+      });
+    };
+    const failed = error => {
+      if (!active) return;
+      setCloudData(previous => ({
+        ...(previous.owner === user.uid ? previous : emptyCloudData(user.uid)),
+        error: describeServiceError(error),
+      }));
+    };
+    // Wait for the server before seeding. An empty offline cache is not an empty database.
+    const prodUnsub = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'products'), { includeMetadataChanges: true }, async snapshot => {
+      if (!active || snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites) return;
+      const rows = snapshot.docs.map(item => ({ ...item.data(), id: item.id }));
+      if (rows.length) {
+        applyRows('products', rows.sort((a, b) => parseInt(a.code) - parseInt(b.code)));
+      } else if (!productSeed) {
+        productSeed = Promise.all(DEFAULT_PRODUCTS.map(product => setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'products', product.id), product)));
+        try { await productSeed; } catch (error) { failed(error); }
       }
-    });
-    const orderUnsub = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'orders'), (snap) => {
-      setOrders(snap.docs.map(d => ({ ...d.data(), id: d.id })));
-    });
-    const branchUnsub = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'branches'), async (snap) => {
-      const list = snap.docs.map(d => d.data());
-      if (list.length > 0) setBranches(list);
-      else {
-         await Promise.all(INITIAL_BRANCHES.map(b => setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'branches', b.id), b)));
-         setBranches(INITIAL_BRANCHES);
+    }, failed);
+    const orderUnsub = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'orders'), { includeMetadataChanges: true }, snapshot => {
+      if (!active || snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites) return;
+      applyRows('orders', snapshot.docs.map(item => ({ ...item.data(), id: item.id })));
+    }, failed);
+    const branchUnsub = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, 'branches'), { includeMetadataChanges: true }, async snapshot => {
+      if (!active || snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites) return;
+      const rows = snapshot.docs.map(item => ({ ...item.data(), id: item.id }));
+      if (rows.length) {
+        applyRows('branches', rows);
+      } else if (!branchSeed) {
+        branchSeed = Promise.all(INITIAL_BRANCHES.map(branch => setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'branches', branch.id), branch)));
+        try { await branchSeed; } catch (error) { failed(error); }
       }
-    });
-    setLoading(false);
-    return () => { prodUnsub(); orderUnsub(); branchUnsub(); };
+    }, failed);
+    return () => { active = false; prodUnsub(); orderUnsub(); branchUnsub(); };
   }, [user]);
 
-  const updateProduct = async (product) => { if(user) await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'products', product.id), product); };
-  
-  const saveOrder = async (orderData) => {
-    if(!user) return;
-    const existing = orders.find(o => o.date === orderData.date && o.branchId === orderData.branchId);
-    if (existing) {
-       await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'orders', existing.id), { ...orderData, updatedAt: new Date().toISOString() });
-    } else {
-       await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'orders'), orderData);
-    }
+  const updateProduct = async product => {
+    if (!user) throw new Error('请先登录。');
+    await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'products', product.id), product);
   };
+  
+  const saveOrder = useCallback(async orderData => {
+    if (!user) throw new Error('请先登录。');
+    const existing = orders.find(o => o.date === orderData.date && o.branchId === orderData.branchId);
+    const id = existing?.id || `${orderData.date}_${encodeURIComponent(orderData.branchId)}`;
+    await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'orders', id), {
+      ...orderData,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [user, orders]);
 
-  const addBranch = async (branchData) => { if(user) await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'branches', branchData.id), branchData); };
+  const addBranch = async branchData => {
+    if (!user) throw new Error('请先登录。');
+    await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'branches', branchData.id), branchData);
+  };
 
   const onResetData = async () => {
       if(!user) return;
@@ -1077,22 +1132,57 @@ const App = () => {
         try {
             await Promise.all(DEFAULT_PRODUCTS.map(p => setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'products', p.id), p)));
             alert("重置成功!");
-        } catch(e) { alert("Error resetting"); }
+        } catch(error) { alert(describeServiceError(error)); }
       }
   }
 
-  if (loading) return <div className="flex h-screen items-center justify-center">Loading System...</div>;
+  const logout = async () => {
+    try { await signOut(auth); } catch (error) { alert(describeServiceError(error)); }
+  };
+
+  if (configurationError) return (
+    <main className="min-h-screen bg-slate-100 flex items-center justify-center p-5">
+      <div className="max-w-md bg-white rounded-2xl border border-slate-200 p-8 shadow-sm">
+        <h1 className="text-2xl font-bold text-slate-900">MING JII</h1>
+        <p role="status" className="text-slate-600 mt-4">{configurationError}</p>
+      </div>
+    </main>
+  );
+  if (!session.ready) return <div role="status" className="flex min-h-screen items-center justify-center gap-3"><Loader className="animate-spin" /> 正在连接登录服务…</div>;
+  if (!user) return <Login initialError={session.error} />;
+  const ownedData = cloudData.owner === user.uid;
+  if (ownedData && cloudData.error) return (
+    <main className="min-h-screen flex flex-col gap-4 items-center justify-center p-6">
+      <p role="alert" className="text-red-700">{cloudData.error}</p>
+      <div className="flex gap-4"><button className="bg-slate-900 text-white px-4 py-2 rounded" onClick={() => window.location.reload()}>重新连接</button><button className="px-4 py-2 border rounded" onClick={logout}>退出登录</button></div>
+    </main>
+  );
+  if (!ownedData || !Object.values(cloudData.ready).every(Boolean)) return (
+    <main className="min-h-screen flex flex-col items-center justify-center gap-4 p-6">
+      <p role="status" className="flex items-center gap-3"><Loader className="animate-spin" /> 正在载入云端资料…</p>
+      <p className="text-sm text-slate-500">需要网络连接。若等待时间较长，请检查网络后重试。</p>
+      <div className="flex gap-4"><button className="border rounded px-4 py-2" onClick={() => window.location.reload()}>重新连接</button><button className="border rounded px-4 py-2" onClick={logout}>退出登录</button></div>
+    </main>
+  );
 
   return (
     <div className="flex h-screen bg-slate-100 font-sans text-slate-900">
       <Sidebar currentView={currentView} setView={setView} />
       <main className="flex-1 md:ml-64 overflow-y-auto bg-slate-50">
-        <div className="md:hidden bg-slate-900 text-white p-4 flex justify-between items-center sticky top-0 z-30 shadow-md">
-          <button onClick={() => setView('newOrder')} className="font-bold text-yellow-400 text-lg">MING JII</button>
-          <button onClick={() => setView('newOrder')}><FileText /></button>
+        <div className="print:hidden bg-white border-b border-slate-200 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+          <span className="text-sm text-slate-600">{emulatorMode ? '本机测试环境' : '云端资料'}{user.email ? ` · ${user.email}` : ''}</span>
+          <button onClick={logout} disabled={pendingChanges} className="text-sm border border-slate-300 rounded-lg px-3 py-1.5 disabled:opacity-50" title={pendingChanges ? '订单保存完成后可以退出' : undefined}>退出登录</button>
+        </div>
+        <div className="md:hidden print:hidden bg-slate-900 text-white p-3 sticky top-0 z-30 shadow-md">
+          <p className="font-bold text-yellow-400 text-lg mb-3">MING JII</p>
+          <nav aria-label="手机导航" className="flex gap-2 overflow-x-auto text-sm">
+            {[['newOrder', '开单'], ['products', '货价'], ['reports', '报表'], ['settings', '设定']].map(([view, label]) => <button key={view} onClick={() => setView(view)} className={`whitespace-nowrap px-3 py-2 rounded ${currentView === view ? 'bg-yellow-400 text-slate-900' : 'bg-slate-800'}`}>{label}</button>)}
+          </nav>
         </div>
         {currentView === 'products' && <ProductManager products={products} onUpdateProduct={updateProduct} onInitData={onResetData} />}
-        {currentView === 'newOrder' && <OrderForm products={products} branches={branches.length > 0 ? branches : INITIAL_BRANCHES} onSaveOrder={saveOrder} orders={orders} />}
+        <div key={user.uid} className={currentView === 'newOrder' ? '' : 'hidden'}>
+          <OrderForm products={products} branches={branches} onSaveOrder={saveOrder} orders={orders} onPendingChange={setPendingChanges} />
+        </div>
         {currentView === 'reports' && <Reports orders={orders} branches={branches} />}
         {currentView === 'settings' && <SettingsPage branches={branches} onAddBranch={addBranch} products={products} orders={orders} />}
       </main>
